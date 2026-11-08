@@ -1,0 +1,220 @@
+name: Build Xash3D FWGS (arm64-v8a) + CS16Client (Android)
+
+# Положите файл в .github/workflows/build-android.yml
+# репозитория, из которого запускается сборка (обычно — репозиторий клиента).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+env:
+  # --- Репозитории -----------------------------------------------------------
+  # Клиент: по умолчанию — репозиторий, в котором лежит этот workflow.
+  CLIENT_REPO: ${{ github.repository }}
+  CLIENT_REF: ${{ github.ref_name }}
+  # Движок: замените на свой форк, если вносите в него изменения.
+  ENGINE_REPO: FWGS/xash3d-fwgs
+  ENGINE_REF: master
+
+  # --- Версии, которые ожидают скрипты движка (scripts/gha/*.sh) -------------
+  SDL_VERSION: 2.32.10
+  FFMPEG_VERSION: '9.0'
+  GH_CPU_OS: android
+  GH_CPU_ARCH: multiarch
+
+  # --- Android toolchain -----------------------------------------------------
+  NDK_28: 28.2.13676358   # требует клиент (android/app/build.gradle)
+  NDK_29: 29.0.14206865   # требует движок (android/app/build.gradle.kts)
+  CMAKE_VERSION: 3.22.1   # externalNativeBuild.cmake.version клиента
+
+jobs:
+  build:
+    name: Build engine + client
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ------------------------------------------------------------------ 1
+      - name: Checkout engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          path: engine
+          submodules: false
+
+      - name: Checkout client
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CLIENT_REPO }}
+          ref: ${{ env.CLIENT_REF }}
+          path: client
+          submodules: false
+
+      # ------------------------------------------------------------------ 2
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            client/android/**/*.gradle*
+            client/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ------------------------------------------------------------------ 3
+      - name: Install CMake, Ninja and ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache
+          cmake --version
+          python --version
+
+      - name: Install Android SDK components (NDK 28 + NDK 29 + CMake)
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;${CMAKE_VERSION}" \
+            "ndk;${NDK_28}" \
+            "ndk;${NDK_29}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_28}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------ 4
+      # Подмодули. Сначала штатный `git submodule update --init --recursive`.
+      # Если в репозитории нет gitlink-записей (так бывает, когда код залит
+      # из ZIP без подмодулей), клонируем их вручную по .gitmodules.
+      - name: Init submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          init_submodules() {
+            local dir="$1"
+            pushd "$dir" > /dev/null
+
+            if git ls-files --stage | grep -q '^160000'; then
+              echo "::group::$dir: git submodule update --init --recursive"
+              git submodule sync --recursive
+              git submodule update --init --recursive
+              echo "::endgroup::"
+            else
+              echo "::warning::$dir: gitlink-записей нет, клонирую подмодули из .gitmodules (HEAD веток по умолчанию)"
+              git config -f .gitmodules --get-regexp '^submodule\..*\.path$' |
+              while read -r key path; do
+                name="${key#submodule.}"; name="${name%.path}"
+                url="$(git config -f .gitmodules --get "submodule.${name}.url")"
+                upd="$(git config -f .gitmodules --get "submodule.${name}.update" || true)"
+                [ "$upd" = "none" ] && continue
+                rm -rf "$path"
+                git clone --recursive "$url" "$path"
+              done
+            fi
+            popd > /dev/null
+          }
+
+          init_submodules engine
+          init_submodules client
+
+          # deps_android.sh движка сам делает `git submodule update` для
+          # nanogl и gl4es. Без gitlink'ов это упадёт — подстрахуемся.
+          if ! (cd engine && git ls-files --stage | grep -q '^160000'); then
+            git clone https://github.com/FWGS/nanogl engine/3rdparty/nanogl
+            git clone https://github.com/ptitSeb/gl4es engine/3rdparty/gl4es/gl4es
+            sed -i '/git submodule update --init --checkout 3rdparty\/nanogl/d' \
+              engine/scripts/gha/deps_android.sh
+          fi
+
+      - name: Fetch YaPB history (нужна для версии бота)
+        run: git -C client/3rdparty/yapb fetch --unshallow origin || true
+
+      # ------------------------------------------------------------------ 5
+      # deps_android.sh и build_android.sh ожидают, что корень движка и есть
+      # $GITHUB_WORKSPACE, поэтому переопределяем эту переменную на engine/.
+      - name: Engine — dependencies (deps_android.sh)
+        working-directory: engine
+        run: GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_android.sh
+
+      - name: Engine — restrict ABI to arm64-v8a
+        working-directory: engine
+        run: |
+          F=android/app/build.gradle.kts
+          sed -i 's/setOf("armeabi-v7a", "arm64-v8a", "x86")/setOf("arm64-v8a")/' "$F"
+          grep -n 'ninja.abiFilters' "$F"
+          grep -q 'ninja.abiFilters"\] = setOf("arm64-v8a")' "$F" \
+            || { echo "::error::Не удалось ограничить ABI — проверьте $F"; exit 1; }
+
+      - name: Engine — build (build_android.sh)
+        working-directory: engine
+        run: GITHUB_WORKSPACE="$PWD" bash scripts/gha/build_android.sh
+
+      # ------------------------------------------------------------------ 6
+      - name: Client — build (assembleGitDebug)
+        working-directory: client/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleGitDebug --stacktrace
+
+      # ------------------------------------------------------------------ 7
+      - name: Collect .apk and .so files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/apk out/so out/so-unstripped
+
+          # APK
+          cp engine/artifacts/*.apk out/apk/
+          cp client/android/app/build/outputs/apk/git/debug/*.apk out/apk/
+          ls -lh out/apk
+
+          # .so из готовых APK (то, что реально попадёт на устройство)
+          for apk in out/apk/*.apk; do
+            n="$(basename "$apk" .apk)"
+            mkdir -p "out/so/$n"
+            unzip -o -q "$apk" 'lib/*' -d "out/so/$n" || true
+          done
+
+          # .so с отладочными символами (до strip)
+          find engine/android/app/build client/android/app/build \
+               -type f -name '*.so' -path '*merged_native_libs*' -print0 |
+            xargs -0 -r -I{} cp --parents {} out/so-unstripped/
+
+          find out -name '*.so' | sort
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: out/apk/*.apk
+          if-no-files-found: error
+
+      - name: Upload .so (из APK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: so-libs
+          path: out/so
+          if-no-files-found: error
+
+      - name: Upload .so (с отладочными символами)
+        uses: actions/upload-artifact@v4
+        with:
+          name: so-libs-unstripped
+          path: out/so-unstripped
+          if-no-files-found: warn
+
+      - name: Upload engine mapping files
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-mappings
+          path: engine/artifacts/*mappings*
+          if-no-files-found: ignore
